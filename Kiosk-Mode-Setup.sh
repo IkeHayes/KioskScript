@@ -159,12 +159,13 @@ while true; do
     --kiosk \
     --start-fullscreen \
     --app="$URL" \
+    --ignore-certificate-errors \
+    --allow-insecure-localhost \
     --noerrdialogs \
     --disable-infobars \
     --disable-session-crashed-bubble \
     --disable-features=Translate,InfiniteSessionRestore \
     --overscroll-history-navigation=0 \
-    --incognito \
     --touch-events=enabled
 
   sleep 2
