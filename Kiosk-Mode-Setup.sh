@@ -48,7 +48,6 @@ apt-get update
 
 echo "=== Installing required packages ==="
 apt-get install -y \
-  snapd \
   xorg \
   openbox \
   lightdm \
@@ -67,14 +66,33 @@ if [[ -n "$HOSTNAME_SET" ]]; then
   hostnamectl set-hostname "$HOSTNAME_SET"
 fi
 
-echo "=== Ensuring snapd is running ==="
-systemctl enable snapd.service || true
-systemctl start snapd.service || true
-snap wait system seed.loaded || true
-
 echo "=== Installing Chromium ==="
-if ! snap list chromium >/dev/null 2>&1; then
-  snap install chromium
+CHROMIUM_BIN=""
+if apt-cache show chromium >/dev/null 2>&1; then
+  apt-get install -y chromium
+  CHROMIUM_BIN="$(command -v chromium || true)"
+elif apt-cache show chromium-browser >/dev/null 2>&1; then
+  apt-get install -y chromium-browser
+  if command -v chromium >/dev/null 2>&1; then
+    CHROMIUM_BIN="$(command -v chromium)"
+  elif command -v chromium-browser >/dev/null 2>&1; then
+    CHROMIUM_BIN="$(command -v chromium-browser)"
+  fi
+else
+  echo "No apt Chromium package found; falling back to snap"
+  apt-get install -y snapd
+  systemctl enable snapd.service || true
+  systemctl start snapd.service || true
+  snap wait system seed.loaded || true
+  if ! snap list chromium >/dev/null 2>&1; then
+    snap install chromium
+  fi
+  CHROMIUM_BIN="/snap/bin/chromium"
+fi
+
+if [[ -z "$CHROMIUM_BIN" ]]; then
+  echo "Could not locate a Chromium executable after installation"
+  exit 1
 fi
 
 echo "=== Creating kiosk user if needed ==="
@@ -91,6 +109,12 @@ cat >/etc/kiosk-url <<EOF
 $KIOSK_URL
 EOF
 chmod 644 /etc/kiosk-url
+
+echo "=== Saving Chromium binary path ==="
+cat >/etc/kiosk-browser-bin <<EOF
+$CHROMIUM_BIN
+EOF
+chmod 644 /etc/kiosk-browser-bin
 
 echo "=== Creating Openbox session entry ==="
 mkdir -p /usr/share/xsessions
@@ -144,6 +168,7 @@ cat >/usr/local/bin/kiosk-browser-loop.sh <<'EOF'
 set -euo pipefail
 
 URL="$(cat /etc/kiosk-url)"
+BROWSER_BIN="$(cat /etc/kiosk-browser-bin)"
 
 export DISPLAY=:0
 
@@ -155,7 +180,7 @@ for _ in $(seq 1 30); do
 done
 
 while true; do
-  /snap/bin/chromium \
+  "$BROWSER_BIN" \
     --kiosk \
     --start-fullscreen \
     --app="$URL" \
@@ -180,8 +205,8 @@ set -euo pipefail
 
 export DISPLAY=:0
 
-for _ in $(seq 1 60); do
-  if xdpyinfo -display :0 >/dev/null 2>&1; then
+for _ in $(seq 1 90); do
+  if [[ -S /tmp/.X11-unix/X0 ]]; then
     exec /usr/bin/x11vnc \
       -display :0 \
       -auth guess \
@@ -191,12 +216,13 @@ for _ in $(seq 1 60); do
       -repeat \
       -shared \
       -rfbauth /etc/x11vnc/passwd \
-      -rfbport 5900
+      -rfbport 5900 \
+      -o /var/log/x11vnc.log
   fi
   sleep 2
 done
 
-echo "x11vnc could not find an active X11 display on :0" >&2
+echo "x11vnc could not find X11 socket /tmp/.X11-unix/X0" >&2
 exit 1
 EOF
 chmod 755 /usr/local/bin/kiosk-x11vnc-launcher.sh
@@ -288,6 +314,10 @@ echo "=== Enabling LightDM ==="
 systemctl unmask lightdm.service || true
 systemctl enable lightdm.service
 
+echo "=== Enabling SSH ==="
+systemctl unmask ssh.service || true
+systemctl enable --now ssh.service
+
 echo "=== Reloading systemd ==="
 systemctl daemon-reload
 
@@ -317,12 +347,21 @@ fi
 
 systemctl is-enabled lightdm.service >/dev/null
 systemctl is-enabled x11vnc.service >/dev/null
+systemctl is-enabled ssh.service >/dev/null
+systemctl is-active --quiet ssh.service
 
 if systemctl is-active --quiet lightdm.service; then
   echo "LightDM is active; verifying x11vnc runtime state"
   systemctl restart x11vnc.service
 
-  for _ in $(seq 1 15); do
+  if [[ ! -S /tmp/.X11-unix/X0 ]]; then
+    echo "LightDM is active but /tmp/.X11-unix/X0 does not exist"
+    systemctl status x11vnc.service --no-pager || true
+    journalctl -u x11vnc.service -n 50 --no-pager || true
+    exit 1
+  fi
+
+  for _ in $(seq 1 30); do
     if systemctl is-active --quiet x11vnc.service && ss -ltn '( sport = :5900 )' | grep -q ':5900'; then
       break
     fi
@@ -332,12 +371,16 @@ if systemctl is-active --quiet lightdm.service; then
   if ! systemctl is-active --quiet x11vnc.service; then
     echo "x11vnc service failed to stay active"
     systemctl status x11vnc.service --no-pager || true
+    journalctl -u x11vnc.service -n 50 --no-pager || true
+    tail -n 50 /var/log/x11vnc.log 2>/dev/null || true
     exit 1
   fi
 
   if ! ss -ltn '( sport = :5900 )' | grep -q ':5900'; then
     echo "x11vnc is not listening on TCP port 5900"
     systemctl status x11vnc.service --no-pager || true
+    journalctl -u x11vnc.service -n 50 --no-pager || true
+    tail -n 50 /var/log/x11vnc.log 2>/dev/null || true
     exit 1
   fi
 else
@@ -353,6 +396,7 @@ ls -l /etc/systemd/system/display-manager.service || true
 echo "Enabled services:"
 systemctl is-enabled lightdm.service || true
 systemctl is-enabled x11vnc.service || true
+systemctl is-enabled ssh.service || true
 
 echo
 echo "Setup complete."
