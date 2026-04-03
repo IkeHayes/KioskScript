@@ -47,15 +47,19 @@ echo "=== Updating packages ==="
 apt-get update
 
 echo "=== Installing required packages ==="
-apt-get install -y \
+apt-get install -y --no-install-recommends \
   xorg \
   openbox \
   lightdm \
   lightdm-gtk-greeter \
+  xserver-xorg-input-libinput \
   x11-xserver-utils \
   x11-utils \
   x11vnc \
   unclutter \
+  libinput-tools \
+  xinput \
+  evtest \
   dbus-x11 \
   curl \
   ca-certificates \
@@ -66,29 +70,14 @@ if [[ -n "$HOSTNAME_SET" ]]; then
   hostnamectl set-hostname "$HOSTNAME_SET"
 fi
 
-echo "=== Installing Chromium ==="
-CHROMIUM_BIN=""
-if apt-cache show chromium >/dev/null 2>&1; then
-  apt-get install -y chromium
-  CHROMIUM_BIN="$(command -v chromium || true)"
-elif apt-cache show chromium-browser >/dev/null 2>&1; then
-  apt-get install -y chromium-browser
-  if command -v chromium >/dev/null 2>&1; then
-    CHROMIUM_BIN="$(command -v chromium)"
-  elif command -v chromium-browser >/dev/null 2>&1; then
-    CHROMIUM_BIN="$(command -v chromium-browser)"
-  fi
-else
-  echo "No apt Chromium package found; falling back to snap"
-  apt-get install -y snapd
-  systemctl enable snapd.service || true
-  systemctl start snapd.service || true
-  snap wait system seed.loaded || true
-  if ! snap list chromium >/dev/null 2>&1; then
-    snap install chromium
-  fi
-  CHROMIUM_BIN="/snap/bin/chromium"
+echo "=== Installing Chromium from snap ==="
+apt-get install -y --no-install-recommends snapd
+systemctl enable --now snapd.service || true
+snap wait system seed.loaded || true
+if ! snap list chromium >/dev/null 2>&1; then
+  snap install chromium
 fi
+CHROMIUM_BIN="/snap/bin/chromium"
 
 if [[ -z "$CHROMIUM_BIN" ]]; then
   echo "Could not locate a Chromium executable after installation"
@@ -161,6 +150,13 @@ autologin-session=openbox
 greeter-hide-users=false
 allow-guest=false
 EOF
+
+echo "=== Writing SSH access policy ==="
+mkdir -p /etc/ssh/sshd_config.d
+cat >/etc/ssh/sshd_config.d/90-kiosk-access.conf <<EOF
+DenyUsers $KIOSK_USER
+EOF
+/usr/sbin/sshd -t
 
 echo "=== Writing browser launcher loop ==="
 cat >/usr/local/bin/kiosk-browser-loop.sh <<'EOF'
@@ -303,11 +299,11 @@ else
 fi
 
 echo "=== Disabling conflicting display managers ==="
-if systemctl list-unit-files gdm.service >/dev/null 2>&1; then
-  systemctl disable gdm.service || true
-fi
 if systemctl list-unit-files gdm3.service >/dev/null 2>&1; then
-  systemctl disable gdm3.service || true
+  if systemctl is-enabled gdm3.service >/dev/null 2>&1; then
+    systemctl disable gdm3.service || true
+  fi
+  systemctl stop gdm3.service || true
 fi
 
 echo "=== Enabling LightDM ==="
@@ -317,6 +313,7 @@ systemctl enable lightdm.service
 echo "=== Enabling SSH ==="
 systemctl unmask ssh.service || true
 systemctl enable --now ssh.service
+systemctl reload ssh.service
 
 echo "=== Reloading systemd ==="
 systemctl daemon-reload
@@ -348,6 +345,7 @@ fi
 systemctl is-enabled lightdm.service >/dev/null
 systemctl is-enabled x11vnc.service >/dev/null
 systemctl is-enabled ssh.service >/dev/null
+/usr/sbin/sshd -t
 systemctl is-active --quiet ssh.service
 
 if systemctl is-active --quiet lightdm.service; then
@@ -397,6 +395,22 @@ echo "Enabled services:"
 systemctl is-enabled lightdm.service || true
 systemctl is-enabled x11vnc.service || true
 systemctl is-enabled ssh.service || true
+
+echo "=== Network summary ==="
+PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+if [[ -n "$PRIMARY_IP" ]]; then
+  echo "Primary IPv4 address: $PRIMARY_IP"
+  echo "SSH endpoint: ssh <admin-user>@$PRIMARY_IP"
+  echo "VNC endpoint: $PRIMARY_IP:5900"
+else
+  echo "Could not determine a primary IPv4 address"
+fi
+
+echo "=== Touchscreen verification ==="
+echo "After reboot, verify touch input with:"
+echo "  libinput list-devices"
+echo "  xinput list"
+echo "  sudo evtest"
 
 echo
 echo "Setup complete."
